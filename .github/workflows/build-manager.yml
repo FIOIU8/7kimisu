@@ -195,10 +195,40 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
+      # 这一步故意做成"尽力而为"：预装成功可以省掉 Gradle 的重复下载，
+      # 装不上也不让流程失败——AGP 自己会按 ndkVersion / compileSdk 自动下载。
+      # 真装不上时把候选包名打出来，方便下一次直接改对。
       - name: 安装 SDK 组件
         run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          if ! command -v sdkmanager > /dev/null; then
+            echo "::warning::PATH 里找不到 sdkmanager，将完全依赖 Gradle 自动下载"
+            exit 0
+          fi
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager --install "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"
+
+          FAILED=0
+          for pkg in "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"; do
+            echo "---------- 尝试安装 $pkg"
+            if sdkmanager --install "$pkg"; then
+              echo "已安装 $pkg"
+            else
+              echo "::warning::$pkg 装不上，交给 Gradle 自动下载"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" = "1" ]; then
+            echo "========== sdkmanager 里真实存在的相关包 =========="
+            sdkmanager --list 2>/dev/null \
+              | grep -E "platforms;android-3[5-9]|build-tools;3[5-9]|ndk;29" \
+              | head -30 || true
+            echo "=================================================="
+          fi
+
+          echo "---------- 当前已安装 ----------"
+          sdkmanager --list_installed 2>/dev/null | head -40 || true
 
       - name: Build with Gradle
         run: |
