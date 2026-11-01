@@ -8,3 +8,23 @@ __pycache__
 /repack-config.json
 /userspace/ksud/.lkm_image_bootstrap.o
 /out
+
+# ── Android / Gradle 构建产物 ──
+# manager/ 与 manager-next/ 都会生成 build/，里面的 APK、mapping.txt、
+# 中间产物动辄上百 MB，绝不能进仓库（否则每次编译 git status 全是噪音）
+build/
+.gradle/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+.kotlin/
+*.apk
+*.aab
+*.ap_
+*.hprof
+*.iml
+
+# 签名相关的私钥最好不要有进仓库的机会
+*.jks
+*.keystore
