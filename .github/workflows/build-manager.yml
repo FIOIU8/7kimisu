@@ -1,0 +1,226 @@
+name: Build Manager
+
+on:
+  push:
+    branches: [ "main", "dev" ]
+    paths:
+      - '.github/workflows/**'
+      - '.github/scripts/setup-rust-build.sh'
+      - 'manager-next/**'
+      - 'manager/app/src/main/cpp/**'
+      - 'manager/app/src/main/jniLibs/**'
+      - 'kernel/**'
+      - 'userspace/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+  pull_request:
+    branches: [ "main", "dev" ]
+    paths:
+      - '.github/workflows/**'
+      - '.github/scripts/setup-rust-build.sh'
+      - 'manager-next/**'
+      - 'manager/app/src/main/cpp/**'
+      - 'manager/app/src/main/jniLibs/**'
+      - 'kernel/**'
+      - 'userspace/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  generate-key:
+    runs-on: ubuntu-latest
+    outputs:
+      expected_size: ${{ steps.extract.outputs.expected_size }}
+      expected_hash: ${{ steps.extract.outputs.expected_hash }}
+      keystore: ${{ steps.gen.outputs.keystore }}
+      keystore_password: ${{ steps.gen.outputs.keystore_password }}
+      key_password: ${{ steps.gen.outputs.key_password }}
+    steps:
+      - name: Generate temporary keystore
+        if: github.event_name == 'pull_request'
+        id: gen
+        run: |
+          KEYSTORE_PASSWORD=$(openssl rand -hex 32)
+          KEY_PASSWORD=$(openssl rand -hex 32)
+          echo "keystore_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
+          echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
+
+          keytool -genkeypair \
+            -alias pr-key \
+            -keyalg RSA -keysize 2048 \
+            -validity 1 \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
+            -dname "CN=7kimisu PR Build" \
+            -storetype JKS \
+            -keystore pr-key.jks
+
+          echo "keystore=$(base64 -w 0 pr-key.jks)" >> $GITHUB_OUTPUT
+
+      - name: Extract certificate hash and size
+        if: github.event_name == 'pull_request'
+        id: extract
+        env:
+          STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
+        run: |
+          keytool -exportcert \
+            -alias pr-key \
+            -keystore pr-key.jks \
+            -storepass "$STORE_PASS" \
+            -file pr-cert.der
+
+          SIZE_DEC=$(stat -c%s pr-cert.der)
+          SIZE_HEX=$(printf '0x%04x' "$SIZE_DEC")
+          echo "expected_size=$SIZE_HEX" >> $GITHUB_OUTPUT
+
+          HASH=$(sha256sum pr-cert.der | awk '{print $1}')
+          echo "expected_hash=$HASH" >> $GITHUB_OUTPUT
+
+          echo "Certificate size: $SIZE_HEX ($SIZE_DEC bytes)"
+          echo "Certificate hash: $HASH"
+
+  build-lkm:
+    needs: generate-key
+    uses: ./.github/workflows/build-lkm.yml
+    with:
+      expected_size2: ${{ needs.generate-key.outputs.expected_size || '' }}
+      expected_hash2: ${{ needs.generate-key.outputs.expected_hash || '' }}
+    secrets: inherit
+
+  build-ksuinit:
+    uses: ./.github/workflows/ksuinit.yml
+
+  build-ksud:
+    needs: [build-lkm, build-ksuinit]
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-linux-android
+          - target: x86_64-linux-android
+    uses: ./.github/workflows/ksud.yml
+    with:
+      target: ${{ matrix.target }}
+      pack_lkm: true
+      pack_ksuinit: true
+
+  build-manager:
+    needs: [generate-key, build-ksud]
+    if: always() && needs.generate-key.result == 'success' && needs.build-ksud.result == 'success'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./manager-next
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 下载 ksud（arm64-v8a）
+        uses: actions/download-artifact@v8
+        with:
+          name: ksud-aarch64-linux-android
+          path: artifacts/ksud-arm64
+
+      - name: 下载 ksud（x86_64）
+        uses: actions/download-artifact@v8
+        with:
+          name: ksud-x86_64-linux-android
+          path: artifacts/ksud-x86_64
+
+      # manager-next 通过 jniLibs.srcDir("../../manager/app/src/main/jniLibs") 取 libksud.so。
+      # 这一步必须在 assembleRelease 之前完成，否则打出来的 APK 里没有 ksud。
+      - name: 把 ksud 放进 jniLibs
+        run: |
+          set -euo pipefail
+          JNI="$GITHUB_WORKSPACE/manager/app/src/main/jniLibs"
+          rm -rf "$JNI"
+          mkdir -p "$JNI/arm64-v8a" "$JNI/x86_64"
+
+          ARM=$(find "$GITHUB_WORKSPACE/artifacts/ksud-arm64" -type f -name ksud | head -n 1)
+          X64=$(find "$GITHUB_WORKSPACE/artifacts/ksud-x86_64" -type f -name ksud | head -n 1)
+          if [ -z "$ARM" ] || [ -z "$X64" ]; then
+            echo "::error::找不到 ksud 产物，检查 build-ksud 是否成功"
+            find "$GITHUB_WORKSPACE/artifacts" -type f | head -20
+            exit 1
+          fi
+
+          cp -f "$ARM" "$JNI/arm64-v8a/libksud.so"
+          cp -f "$X64" "$JNI/x86_64/libksud.so"
+          ls -l "$JNI/arm64-v8a/libksud.so" "$JNI/x86_64/libksud.so"
+
+      - name: Write key
+        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' )) || github.ref_type == 'tag' }}
+        run: |
+          if [ -z "${{ secrets.KEYSTORE }}" ]; then
+            echo "::error::仓库没有配置 KEYSTORE secret，无法产出内核信任的签名包。请按 docs/CI配置步骤.md 配置。"
+            exit 1
+          fi
+          {
+            echo KEYSTORE_PASSWORD='${{ secrets.KEYSTORE_PASSWORD }}'
+            echo KEY_ALIAS='${{ secrets.KEY_ALIAS }}'
+            echo KEY_PASSWORD='${{ secrets.KEY_PASSWORD }}'
+            echo KEYSTORE_FILE='key.jks'
+          } >> gradle.properties
+          echo "${{ secrets.KEYSTORE }}" | base64 -d > key.jks
+          echo "签名库大小: $(stat -c%s key.jks) 字节"
+
+      - name: Write PR key
+        if: github.event_name == 'pull_request'
+        env:
+          PR_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
+          PR_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
+          PR_KEY_PASSWORD: ${{ needs.generate-key.outputs.key_password }}
+        run: |
+          echo "$PR_KEYSTORE" | base64 -d > pr-key.jks
+          {
+            echo KEYSTORE_PASSWORD="$PR_KEYSTORE_PASSWORD"
+            echo KEY_ALIAS='pr-key'
+            echo KEY_PASSWORD="$PR_KEY_PASSWORD"
+            echo KEYSTORE_FILE='pr-key.jks'
+          } >> gradle.properties
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: 安装 SDK 组件
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"
+
+      - name: Build with Gradle
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "按 tag 构建：${{ github.ref_name }}"
+            ./gradlew clean :app:assembleRelease -PKSU_VERSION_NAME=${{ github.ref_name }}
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            ./gradlew clean :app:assembleRelease -PIS_PR_BUILD=true
+          else
+            ./gradlew clean :app:assembleRelease
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: manager
+          path: manager-next/app/build/outputs/apk/release/*.apk
+
+      - name: Upload mappings
+        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' )) || github.ref_type == 'tag' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: "mappings"
+          path: "manager-next/app/build/outputs/mapping/release/"

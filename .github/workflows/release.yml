@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-manager.yml
+    secrets: inherit
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+
+      - name: 整理 APK
+        run: |
+          set -euo pipefail
+          mkdir -p apk
+          find . -path ./apk -prune -o -name "*.apk" -type f -print -exec cp -f {} apk/ \;
+          echo "----- APK -----"
+          ls -l apk
+
+      - name: 整理内核模块
+        run: |
+          set -euo pipefail
+          mkdir -p lkm
+          for dir in ./*-android*-lkm; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            ko=$(find "$dir" -type f -name "*_sevenk.ko" | head -n 1)
+            if [ -z "$ko" ]; then
+              echo "跳过 $name（没找到 .ko）"
+              continue
+            fi
+            cp -f "$ko" "lkm/lkm-${name%-lkm}_sevenk.ko"
+          done
+          echo "----- 内核模块 -----"
+          ls -l lkm
+
+      - name: 检查产物完整性
+        run: |
+          set -euo pipefail
+          apk_count=$(ls -1 apk/*.apk 2>/dev/null | wc -l)
+          ko_count=$(ls -1 lkm/*.ko 2>/dev/null | wc -l)
+          echo "APK: $apk_count 个，内核模块: $ko_count 个"
+          if [ "$apk_count" -eq 0 ]; then
+            echo "::error::没有产出 APK，检查 build-manager 日志"
+            exit 1
+          fi
+          if [ "$ko_count" -eq 0 ]; then
+            echo "::warning::没有产出内核模块。若这次只改管理器可以忽略；否则检查 build-lkm 日志。"
+          fi
+
+      - name: 发布到 GitHub Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            apk/*.apk
+            lkm/*.ko
+          generate_release_notes: true
+          body: |
+            > 本版本的管理器与内核模块使用新签名密钥签发，**必须配套刷入本次的 `.ko` 内核模块**，
+            > 否则内核对管理器不认主（会显示「未安装」）。
+
+            安装顺序：先刷内核模块 → 再装 APK。

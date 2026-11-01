@@ -28,3 +28,6 @@ captures/
 # 签名相关的私钥最好不要有进仓库的机会
 *.jks
 *.keystore
+
+# 这个目录由 ksud 构建产物填充（每个架构约 6.6MB），属于构建输入不是源码
+manager/app/src/main/jniLibs/
