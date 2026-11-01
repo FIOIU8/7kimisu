@@ -1,1 +1,6 @@
+# Windows 下 core.autocrlf=true 会把脚本检出成 CRLF，
+# 导致 shebang 失效、set -euo pipefail 报 "invalid option name"。
+# 下面两类文件必须强制 LF。
 *.bat eol=crlf
+*.sh text eol=lf
+gradlew text eol=lf
