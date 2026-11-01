@@ -111,20 +111,45 @@ git push origin v3.0.1
 
 ---
 
-## 六、我预判第一次会翻车的地方
+## 六、首次运行实录（2026-11-01）
 
-这些点我在 Windows 上**无法本地验证**，第一次运行很可能需要调：
+第一版跑通用了 3 轮，记录在这里，以后改 CI 可以对照。
 
-1. **SDK 组件名**。脚本里写的是 `platforms;android-37`、`build-tools;37.0.0`、`ndk;29.0.14206865`。
-   如果 `sdkmanager` 报 "package not found"，用 `sdkmanager --list | grep android-37` 看实际名字。
-2. **Action 版本号**。`checkout@v7`、`upload-artifact@v7`、`download-artifact@v8`、
-   `setup-java@v6`、`gradle/actions/setup-gradle@v6` 都是仓库原有的写法，如果 GitHub 上不存在，
-   job 会在第一步直接报 "Unable to resolve action"，改小一个版本即可。
-3. **DDK 镜像版本** `20260828`（在 `ddk-lkm.yml` 里）。版本不存在会拉不到镜像。
-4. **耗时**。8 个 KMI 的内核模块构建很慢，整条链路可能 30 分钟往上。公开仓库不消耗免费额度。
-5. **`git describe`**。`manager-next/build.gradle.kts` 里定义了 `getGitDescribe()` 但**没有任何地方调用**，
-   版本号默认是 `v3.0.0` / `3000000`，所以 CI 里没打 tag 也能编过。打 tag 时我用
-   `-PKSU_VERSION_NAME=<tag>` 注入，保证 Release 上的版本号跟 tag 一致。
+| 轮次 | 卡在 | 原因 | 处理 |
+|---|---|---|---|
+| run #1 | `build-manager` 的 `Write key` | 还没配 KEYSTORE secret，守卫主动报错退出 | 配上 4 个 secret |
+| run #1 重跑 | `build-manager` 的 `安装 SDK 组件` | `platforms;android-37` 装不上，4 秒即失败 | 改成"尽力而为 + 打印真实包名" |
+| run #2 | — | — | **全部 14 个 job 通过，耗时 10 分钟** |
+
+**意外顺利的部分**（原本担心但实际没问题）：
+
+- `actions/checkout@v7`、`upload-artifact@v7`、`download-artifact@v8`、`setup-java@v6`
+  这些版本号都是真实存在的
+- DDK 镜像 `20260828` 能正常拉取，8 个 KMI 内核模块一次全过
+- `nttld/setup-ndk@v1` + `ndk-version: r29` 在 ksuinit/ksud job 里是可靠的
+
+**实际出问题的只有一处**：SDK 预装。`platforms;android-37` 这个包名与 sdkmanager 里的实际名称
+对不上（项目 `compileSdk` 用了新的 `minorApiLevel` 写法，带 minor 版本的 platform 包命名不同）。
+
+处理方式：把预装步骤改成非致命——逐包尝试，失败只记 warning，最终交给 AGP 按
+`ndkVersion` / `compileSdk` 自动下载；失败时把 `sdkmanager --list` 里 3x 平台/构建工具/ndk29
+的真实包名打进日志。这样即使包名再变，也不会卡住整个构建。
+
+**run #2 产出的 22 个 artifact**：
+
+- `manager`（约 10 MB）—— 签名后的 APK
+- `mappings`（约 7 MB）
+- `ksud-aarch64-linux-android` / `ksud-x86_64-linux-android`
+- `ksuinit-aarch64` / `ksuinit-x86_64`
+- `*-lkm` 共 16 个（8 个 KMI × 2 架构）
+
+**其它说明**：
+
+- 整条链路耗时约 10 分钟，公开仓库不消耗免费额度
+- `manager-next/build.gradle.kts` 里 `getGitDescribe()` 是死代码（没有任何地方调用），
+  版本号默认 `v3.0.0` / `3000000`，所以不打 tag 也能编过；打 tag 时用
+  `-PKSU_VERSION_NAME=<tag>` 注入，保证 Release 上的版本号跟 tag 一致
+
 
 ---
 
